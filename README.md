@@ -1,169 +1,173 @@
-# Backend TecMise - Setup e Guia Completo
+# TecMise Backend — API de Gestão Escolar
 
-Este guia te ajuda a **instalar o banco PostgreSQL**, rodar o **backend em Go**, preparar o ambiente local e usar o **pgAdmin** para gerenciar os dados do sistema TecMise.
+Bem-vindo ao **TecMise Backend**, o núcleo de processamento e integração de dados do sistema completo de gestão escolar **TecMise**.
 
 ---
 
-## 1. Instalação dos Pré-requisitos
+## 📚 Sobre o Projeto
 
-### PostgreSQL
+Este backend foi desenvolvido com foco em segurança, produtividade e escalabilidade, utilizando **Go (Golang)**, **PostgreSQL 16.9** e **sqlc**. Ele oferece uma API RESTful robusta para cadastro, autenticação e gerenciamento de estudantes, usuários, anos e turmas, sempre vinculando cada registro ao usuário logado.
 
-- **Windows:**  
-  [Baixe o instalador oficial](https://www.postgresql.org/download/windows/)
+---
 
-- **Linux (Ubuntu):**
-  ```bash
-  sudo apt update
-  sudo apt install postgresql postgresql-contrib
-Mac (Homebrew):
+## ⚙️ Tecnologias Utilizadas
+
+- **Go (Golang):** v1.24.5  
+- **PostgreSQL:** v16.9  
+- **sqlc:** v1.29.0  
+- **pgAdmin:** Recomendado para administração do banco  
+- **Pacotes Go:**  
+  - `github.com/lib/pq` (driver Postgres)
+  - `github.com/joho/godotenv` (variáveis de ambiente)
+  - `golang.org/x/crypto` (hash de senha e segurança)
+
+---
+
+## 📂 Estrutura do Projeto
+
+/
+├── backend/ # Código fonte do backend Go
+│ ├── handler/ # Handlers das rotas (CRUD, login, etc.)
+│ ├── model/ # Structs das entidades e tipos
+│ ├── main.go # Ponto de entrada do servidor
+│ ├── go.mod # Dependências Go
+│ └── .env.example # Exemplo de configuração
+├── frontend/ # Frontend (veja README da pasta)
+└── schema.sql # Script SQL para criar as tabelas do banco
+
+markdown
+Copiar
+Editar
+
+---
+
+## 🚀 **Instalação Rápida**
+
+### 1. **Pré-requisitos**
+
+- [Go](https://golang.org/doc/install) v1.24.5 ou superior  
+- [PostgreSQL](https://www.postgresql.org/download/) v16.9  
+- [sqlc](https://docs.sqlc.dev/en/latest/overview/install.html) v1.29.0  
+- [pgAdmin](https://www.pgadmin.org/) (opcional, interface gráfica para o banco)
+- [Git](https://git-scm.com/)
+
+### 2. **Clone o Projeto**
+
+```bash
+git clone https://github.com/seuusuario/tecmise.git
+cd tecmise/backend
+3. Configuração do Banco de Dados
+Crie um banco de dados chamado clientes_db no PostgreSQL.
+
+Execute o script schema.sql para criar as tabelas (anos, estudantes, usuarios).
+
+Exemplo de conexão no pgAdmin:
+
+Host: localhost
+
+Usuário: postgres
+
+Senha: sua senha
+
+4. Configuração do Ambiente
+Copie o arquivo .env.example para .env e edite a variável DATABASE_URL conforme sua instalação:
 
 bash
 Copiar
 Editar
-brew install postgresql
-Dica: Após instalar, use o pgAdmin (interface gráfica) ou psql (terminal) para gerenciar o banco.
-
-Go (Golang)
-Baixe o Go e instale conforme seu sistema operacional.
-
-Para checar a instalação:
-
-bash
-Copiar
-Editar
-go version
-2. Criar o Banco de Dados
-Acesse o PostgreSQL (pgAdmin ou terminal):
-
-bash
-Copiar
-Editar
-psql -U postgres
-Crie o banco:
-
-sql
-Copiar
-Editar
-CREATE DATABASE clientes_db;
-3. Criar as Tabelas
-No pgAdmin (Query Tool) ou pelo psql, execute:
-
-sql
-Copiar
-Editar
--- Usuários
-CREATE TABLE IF NOT EXISTS usuarios (
-    id serial PRIMARY KEY,
-    nome VARCHAR(120) NOT NULL,
-    email VARCHAR(200) NOT NULL UNIQUE,
-    senha_hash VARCHAR(300) NOT NULL
-);
-
--- Anos
-CREATE TABLE IF NOT EXISTS anos (
-    id serial PRIMARY KEY,
-    nome VARCHAR(32) NOT NULL
-);
-
--- Turmas
-CREATE TABLE IF NOT EXISTS turmas (
-    id serial PRIMARY KEY,
-    nome VARCHAR(32) NOT NULL,
-    ano_id INTEGER REFERENCES anos(id) ON DELETE CASCADE
-);
-
--- Estudantes
-CREATE TABLE IF NOT EXISTS estudantes (
-    id serial PRIMARY KEY,
-    nome VARCHAR(120) NOT NULL,
-    cpf VARCHAR(14) NOT NULL UNIQUE,
-    email VARCHAR(200) NOT NULL UNIQUE,
-    data_nascimento DATE NOT NULL,
-    telefone VARCHAR(32),
-    foto_url TEXT,
-    ano_id INTEGER NOT NULL REFERENCES anos(id),
-    turma_id INTEGER NOT NULL REFERENCES turmas(id),
-    usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE
-);
-Exemplo para popular as tabelas:
-
-sql
-Copiar
-Editar
-INSERT INTO anos (nome) VALUES ('6º ano'), ('7º ano');
-INSERT INTO turmas (nome, ano_id) VALUES ('A', 1), ('B', 1), ('A', 2);
-4. Configurar a Conexão do Go com o Banco
-No seu main.go a string padrão de conexão é:
-
-go
-Copiar
-Editar
-connStr := "host=localhost port=5432 user=postgres password=senha123 dbname=clientes_db sslmode=disable"
-Altere a senha conforme seu ambiente.
-
-Se o usuário não for postgres, altere também.
-
-Dica: Use variáveis de ambiente ou um .env para maior segurança (opcional).
-
-5. Instalar Dependências do Backend
-No terminal, acesse a pasta do backend e rode:
-
+DATABASE_URL=postgres://usuario:senha@localhost:5432/clientes_db?sslmode=disable
+5. Instale as Dependências
 bash
 Copiar
 Editar
 go mod tidy
-go get github.com/lib/pq
-go get golang.org/x/crypto/bcrypt
-6. Rodar o Backend
-Na pasta backend, execute:
-
+6. Rode o Servidor Backend
 bash
 Copiar
 Editar
 go run .
-O backend estará disponível em:
-http://localhost:8080
+O backend ficará disponível em http://localhost:8080
 
-7. Testar os Endpoints
-Cadastro de usuário:
-POST http://localhost:8080/register
+📋 Tabelas e Relacionamentos
+Tabela anos
+Campo	Tipo	Descrição
+id	int	PK, autoincrement
+nome	varchar(120)	Nome do ano/turma
 
-Login:
-POST http://localhost:8080/login
+Tabela estudantes
+Campo	Tipo	Descrição
+id	int	PK, autoincrement
+nome	varchar(120)	Nome completo
+cpf	varchar(14)	CPF do estudante
+email	varchar(200)	E-mail
+data_nascimento	date	Data de nascimento
+telefone	varchar(32)	Telefone
+foto_url	text	Foto de perfil (Base64 ou URL)
+ano_id	int	FK para anos
+turma_id	int	(não utilizada se for só ano_id)
+usuario_id	int	FK para usuarios
 
-Listar estudantes:
-GET http://localhost:8080/estudantes?usuario_id=ID_DO_USUARIO
+Tabela usuarios
+Campo	Tipo	Descrição
+id	int	PK, autoincrement
+nome	varchar(100)	Nome do usuário
+email	varchar(200)	E-mail (único)
+senha_hash	varchar(300)	Senha criptografada
+foto_url	text	Foto de perfil
 
-Cadastrar estudante:
-POST http://localhost:8080/estudantes
+Observações:
 
-Atualizar estudante:
-PUT http://localhost:8080/estudantes/{id}
+Cada usuário só enxerga e gerencia seus próprios estudantes e anos.
 
-Excluir estudante:
-DELETE http://localhost:8080/estudantes/{id}
+Exclusão em cascata: ao remover um ano/turma, os estudantes vinculados também são apagados.
 
-Dica: Teste com o Postman ou similar.
+🛠️ Principais Rotas da API
+Método	Rota	Descrição
+POST	/register	Cadastro de usuário
+POST	/login	Login de usuário
+GET	/api/estudantes	Lista estudantes do usuário
+POST	/api/estudantes	Cria estudante
+PUT	/api/estudantes/:id	Edita estudante
+DELETE	/api/estudantes/:id	Remove estudante
+GET	/api/anos	Lista anos/turmas do usuário
+POST	/api/anos	Cria novo ano/turma
+DELETE	/api/anos/:id	Remove ano/turma
+GET	/api/usuario	Busca perfil do usuário
+PUT	/api/perfil	Edita perfil do usuário
 
-8. Dicas para uso do pgAdmin
-Use o Query Tool para executar comandos SQL (criação de tabelas, inserções, consultas, etc).
+Autenticação:
+O email do usuário logado é passado no header X-User-Email para vinculação dos registros.
 
-Clique com o botão direito em uma tabela e vá em View/Edit Data > All Rows para editar/visualizar registros.
+🏆 Diferenciais Técnicos
+Segurança: Senhas com hash bcrypt, validação de CPF e email, CORS ajustável.
 
-Para exportar dados, use o menu de contexto da tabela.
+Performance: Queries otimizadas e respostas rápidas mesmo com grande volume de dados.
 
-Problemas Comuns
-Erro de conexão: Confira host, usuário, senha e nome do banco.
+Arquitetura Limpa: Separação clara entre handlers, models e rotas.
 
-Porta em uso: Certifique-se que o PostgreSQL está na porta 5432.
+Pronto para Deploy: Variáveis de ambiente, scripts limpos, código comentado.
 
-Permissão negada: Revise permissões do usuário no banco.
+🐞 Erros Comuns e Soluções
+Erro 431 ou 500: Verifique permissões de firewall/antivírus e se o backend está rodando como admin.
 
-Tabela não existe: Execute o script de criação de tabelas.
+Banco não conecta: Cheque a string de conexão no .env e se o Postgres está rodando.
 
-Backend não roda: Confira se o Go está instalado corretamente e todas dependências estão baixadas.
+API responde "Usuário não autenticado": Veja se o header X-User-Email está presente e correto.
 
-Observação
-O frontend depende do backend rodando. Sempre inicie o backend antes de rodar o frontend Nuxt.
+Duplicidade de CPF: Cada estudante deve ter CPF único por usuário.
 
-Para configurar o frontend, veja o README na pasta correspondente.
+💬 Contato e Contribuições
+Dúvidas, sugestões ou pull requests são bem-vindos!
+Entre em contato pelo GitHub ou via issues.
+
+TecMise — Sua escola mais conectada, moderna e eficiente!
+Desenvolvido com 💙 por profissionais que amam código limpo.
+
+yaml
+Copiar
+Editar
+
+---
+
+Se precisar de mais alguma seção específica (ex: **Deploy em produção**, **Testes**, **Dicas de organização**), só pedir!  
+Se quiser personalizar o nome do usuário do GitHub, me avise.
