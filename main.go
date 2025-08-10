@@ -95,7 +95,7 @@ func registrarRotas(mux *http.ServeMux, db *sql.DB) {
 		http.NotFound(w, r)
 	})))
 
-	// ✅ Checagem de CPF (duplicidade por usuário) — registrar UMA vez só
+	// ✅ Checagem de CPF (duplicidade por usuário)
 	mux.Handle("/api/estudantes/check-cpf", corsMiddleware(handler.VerificarCpfHandler(db)))
 
 	// Estudantes (lista + cria)
@@ -104,7 +104,6 @@ func registrarRotas(mux *http.ServeMux, db *sql.DB) {
 		case http.MethodGet:
 			handler.ListarEstudantesHandler(db)(w, r)
 		case http.MethodPost:
-			// valida e-mail do estudante via middleware sem remover o restante
 			middleware.ValidarEstudanteEmailMiddleware(handler.CriarEstudanteHandler(db))(w, r)
 		default:
 			http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
@@ -124,7 +123,6 @@ func registrarRotas(mux *http.ServeMux, db *sql.DB) {
 		}
 		switch r.Method {
 		case http.MethodPut:
-			// valida e-mail do estudante também nas edições
 			middleware.ValidarEstudanteEmailMiddleware(handler.EditarEstudanteHandler(db))(w, r)
 		case http.MethodDelete:
 			handler.RemoverEstudanteHandler(db)(w, r)
@@ -167,7 +165,7 @@ func registrarRotas(mux *http.ServeMux, db *sql.DB) {
 	// Uploads locais (se usar)
 	mux.Handle("/uploads/", http.StripPrefix("/uploads/", http.FileServer(http.Dir("./uploads"))))
 
-	// Healthcheck simples (útil para Docker/CI)
+	// Healthcheck simples
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
@@ -192,15 +190,21 @@ func main() {
 	mux := http.NewServeMux()
 	registrarRotas(mux, db)
 
+	// Porta dinâmica para Render
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
 	server := &http.Server{
-		Addr:         ":8080",
+		Addr:         ":" + port,
 		Handler:      mux,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 
-	log.Println("Servidor rodando em http://localhost:8080")
+	log.Printf("Servidor rodando na porta %s", port)
 
 	// Graceful shutdown
 	quit := make(chan os.Signal, 1)
