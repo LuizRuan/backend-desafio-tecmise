@@ -1,47 +1,101 @@
 // backend/middleware/cors.go
 //
-// Middleware responsável por habilitar CORS (Cross-Origin Resource Sharing).
-// Permite que clientes frontend hospedados em domínios diferentes do backend
-// consigam consumir a API sem bloqueios do navegador.
+// Middleware CORS configurável por ambiente.
+// Compatível com o uso atual do projeto e alinhado ao comportamento do main.go.
 //
-// 🔹 Como funciona:
-//   - Adiciona cabeçalhos HTTP em todas as respostas:
-//   - Access-Control-Allow-Origin: "*"   → aceita requisições de qualquer origem
-//   - Access-Control-Allow-Methods       → define métodos HTTP aceitos (GET, POST, PUT, DELETE, OPTIONS)
-//   - Access-Control-Allow-Headers       → libera cabeçalhos personalizados usados no frontend
-//   - Se a requisição for do tipo OPTIONS (pré-flight), retorna imediatamente 200 OK.
-//   - Caso contrário, passa o fluxo para o próximo handler da cadeia.
+// Variáveis de ambiente (opcionais):
+// - CORS_ALLOW_ORIGINS   → "*" (default) ou lista separada por vírgula
+// - CORS_ALLOW_METHODS   → "GET, POST, PUT, DELETE, OPTIONS" (default)
+// - CORS_ALLOW_HEADERS   → "Content-Type, X-User-Email" (default)
+// - CORS_MAX_AGE         → "86400" (segundos, default 24h)
+// - CORS_ALLOW_CREDENTIALS → "true" para enviar Access-Control-Allow-Credentials: true
 //
-// 🔹 Pontos de atenção:
-//   - Em produção, o ideal é substituir "*" por domínios específicos confiáveis.
-//   - O cabeçalho "X-User-Email" foi incluído para permitir autenticação/identificação
-//     personalizada no frontend TecMise.
-//
-// 🔹 Uso típico no main.go:
-//
-//	mux := http.NewServeMux()
-//	handler := middleware.Cors(mux)
-//	log.Fatal(http.ListenAndServe(":8080", handler))
+// Observação: se CORS_ALLOW_CREDENTIALS=true, o cabeçalho Access-Control-Allow-Origin
+// nunca será "*" — refletimos a Origin da requisição quando permitida.
+
 package middleware
 
-import "net/http"
+import (
+	"net/http"
+	"os"
+	"strings"
+)
 
-// Cors adiciona os cabeçalhos necessários para permitir requisições cross-origin
-// e trata pré-flight requests (OPTIONS).
+func getEnv(k, def string) string {
+	if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+		return v
+	}
+	return def
+}
+
+func splitCSV(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func originAllowed(origin string, allowed []string) bool {
+	if len(allowed) == 0 {
+		return false
+	}
+	if allowed[0] == "*" {
+		return true
+	}
+	for _, o := range allowed {
+		if o == origin {
+			return true
+		}
+	}
+	return false
+}
+
+// Cors adiciona cabeçalhos CORS e trata pré-flight (OPTIONS).
 func Cors(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Define permissões de origem, métodos e cabeçalhos
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-User-Email")
+	allowedOrigins := splitCSV(getEnv("CORS_ALLOW_ORIGINS", "*"))
+	allowedMethods := getEnv("CORS_ALLOW_METHODS", "GET, POST, PUT, DELETE, OPTIONS")
+	allowedHeaders := getEnv("CORS_ALLOW_HEADERS", "Content-Type, X-User-Email")
+	maxAge := getEnv("CORS_MAX_AGE", "86400")
+	allowCreds := strings.EqualFold(getEnv("CORS_ALLOW_CREDENTIALS", "false"), "true")
 
-		// Se for pré-flight, retorna OK sem chamar o próximo handler
-		if r.Method == "OPTIONS" {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+
+		// Sempre variar por Origin para caches corretos
+		w.Header().Add("Vary", "Origin")
+
+		// Definição de origem permitida
+		if allowCreds {
+			// Com credenciais não podemos usar "*"
+			if origin != "" && originAllowed(origin, allowedOrigins) {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+			}
+		} else {
+			// Modo aberto por padrão
+			if len(allowedOrigins) > 0 && allowedOrigins[0] == "*" {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+			} else if origin != "" && originAllowed(origin, allowedOrigins) {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+			}
+		}
+
+		// Métodos e cabeçalhos
+		w.Header().Set("Access-Control-Allow-Methods", allowedMethods)
+		w.Header().Set("Access-Control-Allow-Headers", allowedHeaders)
+		w.Header().Set("Access-Control-Max-Age", maxAge)
+
+		// Pré-flight
+		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 
-		// Encaminha requisição para o próximo handler
 		next.ServeHTTP(w, r)
 	})
 }

@@ -2,7 +2,7 @@
 // 📄 handler/ano_handler.go
 // ============================================================================
 // 🎯 Responsabilidade
-// - Implementa endpoints REST para gerenciamento de "Ano e Turma" (tabela: anos)
+// - Endpoints REST para gerenciamento de "Ano/Turma" (tabela: anos)
 //   * Listar anos do usuário autenticado
 //   * Criar novo ano vinculado ao usuário
 //   * Remover ano do usuário (com remoção em cascata dos estudantes do mesmo dono)
@@ -18,23 +18,21 @@
 // - Retorna 404 quando o ano não pertencer ao usuário ou não existir.
 //
 // 📤 Formato das respostas
-// - JSON (`Content-Type: application/json`) para retornos com corpo.
+// - JSON (`Content-Type: application/json; charset=utf-8`) para retornos com corpo.
 // - 204 (No Content) para deleção bem-sucedida.
 // - Erros com mensagens claras e status apropriados.
-//
-// Endpoints cobertos:
-// - GET    /api/anos            → ListarAnosHandler
-// - POST   /api/anos            → CriarAnoHandler
-// - DELETE /api/anos/{id}       → RemoverAnoHandler
 // ============================================================================
 
 package handler
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // Ano representa um registro da tabela `anos`.
@@ -42,6 +40,9 @@ type Ano struct {
 	ID   int    `json:"id"`   // identificador do ano/turma
 	Nome string `json:"nome"` // nome exibido (ex.: "8º A")
 }
+
+// timeout padrão para chamadas ao banco
+const dbTimeout = 5 * time.Second
 
 // usuarioIDFromHeader resolve o id do usuário a partir do cabeçalho X-User-Email.
 //
@@ -54,18 +55,19 @@ type Ano struct {
 //   - (0, sql.ErrNoRows) quando o header está vazio ou não encontra usuário.
 //   - Outros erros de banco quando a query falha.
 func usuarioIDFromHeader(db *sql.DB, r *http.Request) (int, error) {
-	email := strings.TrimSpace(r.Header.Get("X-User-Email"))
+	email := strings.TrimSpace(strings.ToLower(r.Header.Get("X-User-Email")))
 	if email == "" {
 		return 0, sql.ErrNoRows
 	}
+	ctx, cancel := context.WithTimeout(r.Context(), dbTimeout)
+	defer cancel()
+
 	var id int
-	err := db.QueryRow("SELECT id FROM usuarios WHERE email=$1", email).Scan(&id)
+	err := db.QueryRowContext(ctx, "SELECT id FROM usuarios WHERE email=$1", email).Scan(&id)
 	return id, err
 }
 
 // ListarAnosHandler trata GET /api/anos
-//
-// Objetivo: listar exclusivamente os anos do usuário autenticado.
 //
 // Regras/erros:
 //   - 401 se não conseguir resolver o usuário pelo header.
@@ -73,15 +75,16 @@ func usuarioIDFromHeader(db *sql.DB, r *http.Request) (int, error) {
 //   - 200 + JSON com array de anos quando OK.
 func ListarAnosHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// 🔐 Resolve o dono
 		uid, err := usuarioIDFromHeader(db, r)
 		if err != nil {
 			http.Error(w, "Usuário não autenticado", http.StatusUnauthorized)
 			return
 		}
 
-		// 📥 Busca filtrando por `usuario_id`
-		rows, err := db.Query(`
+		ctx, cancel := context.WithTimeout(r.Context(), dbTimeout)
+		defer cancel()
+
+		rows, err := db.QueryContext(ctx, `
 			SELECT id, nome
 			  FROM anos
 			 WHERE usuario_id = $1
@@ -93,7 +96,6 @@ func ListarAnosHandler(db *sql.DB) http.HandlerFunc {
 		}
 		defer rows.Close()
 
-		// 🔁 Varre resultados
 		var anos []Ano
 		for rows.Next() {
 			var a Ano
@@ -103,16 +105,17 @@ func ListarAnosHandler(db *sql.DB) http.HandlerFunc {
 			}
 			anos = append(anos, a)
 		}
+		if err := rows.Err(); err != nil {
+			http.Error(w, "Erro ao iterar anos: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 
-		// 📤 Retorno JSON
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(anos)
 	}
 }
 
 // CriarAnoHandler trata POST /api/anos
-//
-// Objetivo: criar um novo ano vinculado ao usuário autenticado.
 //
 // Corpo esperado (JSON):
 //
@@ -125,14 +128,12 @@ func ListarAnosHandler(db *sql.DB) http.HandlerFunc {
 //   - 201 + JSON { id, nome } quando criado.
 func CriarAnoHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// 🔐 Resolve o dono
 		uid, err := usuarioIDFromHeader(db, r)
 		if err != nil {
 			http.Error(w, "Usuário não autenticado", http.StatusUnauthorized)
 			return
 		}
 
-		// 📨 Decodifica & valida entrada
 		var input struct {
 			Nome string `json:"nome"`
 		}
@@ -146,9 +147,11 @@ func CriarAnoHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		// 🧱 Insere e retorna o id criado
+		ctx, cancel := context.WithTimeout(r.Context(), dbTimeout)
+		defer cancel()
+
 		var novoID int
-		err = db.QueryRow(`
+		err = db.QueryRowContext(ctx, `
 			INSERT INTO anos (nome, usuario_id)
 			VALUES ($1, $2) RETURNING id
 		`, input.Nome, uid).Scan(&novoID)
@@ -157,8 +160,7 @@ func CriarAnoHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		// 📤 201 + JSON
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"id":   novoID,
@@ -169,60 +171,61 @@ func CriarAnoHandler(db *sql.DB) http.HandlerFunc {
 
 // RemoverAnoHandler trata DELETE /api/anos/{id}
 //
-// Objetivo: remover um ano do usuário e, em transação, apagar os estudantes
-// vinculados a esse ano e ao mesmo usuário.
-//
 // Regras/erros:
 //   - 405 se método != DELETE.
 //   - 401 se não resolver usuário.
-//   - 400 se id ausente.
+//   - 400 se id ausente ou inválido.
 //   - 500 se falhar iniciar/execução/commit da transação.
 //   - 404 se o ano não existir para esse usuário.
 //   - 204 (No Content) quando removido com sucesso.
 func RemoverAnoHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// ✅ Garante que é DELETE (útil se roteador externo não filtra)
 		if r.Method != http.MethodDelete {
 			http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
 			return
 		}
 
-		// 🔐 Resolve o dono
 		uid, err := usuarioIDFromHeader(db, r)
 		if err != nil {
 			http.Error(w, "Usuário não autenticado", http.StatusUnauthorized)
 			return
 		}
 
-		// 🔎 Extrai o id simples da URL (ex.: "/api/anos/123" → "123")
-		idStr := strings.TrimPrefix(r.URL.Path, "/api/anos/")
-		if strings.TrimSpace(idStr) == "" {
+		// Extrai o id da URL e valida
+		idStr := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/api/anos/"))
+		if idStr == "" {
 			http.Error(w, "ID do ano/turma não informado", http.StatusBadRequest)
 			return
 		}
+		id, err := strconv.Atoi(idStr)
+		if err != nil || id <= 0 {
+			http.Error(w, "ID do ano/turma inválido", http.StatusBadRequest)
+			return
+		}
 
-		// 🔄 Transação: remove estudantes e depois o ano
-		tx, err := db.Begin()
+		ctx, cancel := context.WithTimeout(r.Context(), dbTimeout)
+		defer cancel()
+
+		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			http.Error(w, "Erro ao iniciar transação", http.StatusInternalServerError)
 			return
 		}
-		// rollback seguro caso haja qualquer erro posterior
 		defer func() { _ = tx.Rollback() }()
 
 		// 1) apaga estudantes do mesmo dono e ano
-		if _, err := tx.Exec(
+		if _, err := tx.ExecContext(ctx,
 			`DELETE FROM estudantes WHERE ano_id=$1 AND usuario_id=$2`,
-			idStr, uid,
+			id, uid,
 		); err != nil {
 			http.Error(w, "Erro ao remover estudantes vinculados", http.StatusInternalServerError)
 			return
 		}
 
 		// 2) apaga o ano pertencente ao dono
-		res, err := tx.Exec(
+		res, err := tx.ExecContext(ctx,
 			`DELETE FROM anos WHERE id=$1 AND usuario_id=$2`,
-			idStr, uid,
+			id, uid,
 		)
 		if err != nil {
 			http.Error(w, "Erro ao remover ano/turma", http.StatusInternalServerError)
@@ -230,18 +233,17 @@ func RemoverAnoHandler(db *sql.DB) http.HandlerFunc {
 		}
 
 		// Se nenhuma linha foi afetada, o registro não existe/pertence ao usuário
-		if rows, _ := res.RowsAffected(); rows == 0 {
+		aff, _ := res.RowsAffected()
+		if aff == 0 {
 			http.Error(w, "Ano/Turma não encontrado", http.StatusNotFound)
 			return
 		}
 
-		// 3) confirma a transação
 		if err := tx.Commit(); err != nil {
 			http.Error(w, "Erro ao confirmar exclusão", http.StatusInternalServerError)
 			return
 		}
 
-		// ✅ Sucesso sem corpo
 		w.WriteHeader(http.StatusNoContent)
 	}
 }

@@ -1,20 +1,9 @@
 // main.go
 //
 // 🔧 Ponto de entrada do backend TecMise (HTTP + PostgreSQL)
-//
-// O que este arquivo faz:
-// 1) Carrega variáveis de ambiente (.env) e conecta ao Postgres.
-// 2) Registra todas as rotas/handlers (auth, perfil, estudantes, anos).
-// 3) Sobe um servidor HTTP com CORS (modo dev) e timeouts.
-// 4) Implementa graceful shutdown (SIGINT/SIGTERM).
-//
-// Dependências diretas (ver go.mod):
-// - github.com/joho/godotenv: carregar .env
-// - github.com/lib/pq: driver PostgreSQL
-//
-// Portas/URLs padrão:
-// - Servidor: http://localhost:8080
-// - Healthcheck: GET /healthz
+// Mantém o comportamento atual, mas com melhorias de organização,
+// middlewares encadeáveis, CORS configurável por ambiente e shutdown
+// mais robusto.
 
 package main
 
@@ -37,34 +26,89 @@ import (
 	_ "github.com/lib/pq"
 )
 
-/*
-===============================================================================
+//
+// ==============================
+// Helpers de configuração (.env)
+// ==============================
+//
 
-	CORS (modo dev)
+func getEnv(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
 
--------------------------------------------------------------------------------
+func getEnvAsInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
 
-	Em desenvolvimento deixamos CORS permissivo para facilitar o front local.
-	Em produção, **recomenda-se restringir** o `Access-Control-Allow-Origin` para
-	o(s) domínio(s) do seu frontend.
+func getEnvAsDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return def
+}
 
-	Como usar:
-	  mux.Handle("/rota", corsMiddleware(handler))
+//
+// ===================
+// Middlewares comuns
+// ===================
+//
 
-===============================================================================
-*/
+// Encadeia middlewares (o último na lista roda mais "externo")
+func apply(h http.Handler, mws ...func(http.Handler) http.Handler) http.Handler {
+	for i := len(mws) - 1; i >= 0; i-- {
+		h = mws[i](h)
+	}
+	return h
+}
+
+// CORS simples com controle por ambiente
+// CORS_ALLOW_ORIGINS="*"                → libera tudo (dev)
+// CORS_ALLOW_ORIGINS="http://a.com,... "→ lista de origens permitidas
 func corsMiddleware(next http.Handler) http.Handler {
+	allowed := strings.Split(strings.TrimSpace(getEnv("CORS_ALLOW_ORIGINS", "*")), ",")
+	for i := range allowed {
+		allowed[i] = strings.TrimSpace(allowed[i])
+	}
+
+	isAllowed := func(origin string) bool {
+		if len(allowed) == 0 {
+			return false
+		}
+		if allowed[0] == "*" {
+			return true
+		}
+		for _, o := range allowed {
+			if o == origin {
+				return true
+			}
+		}
+		return false
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// ⛳️ Ajuste `*` para o domínio do seu front em produção.
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		// Métodos aceitos
+		origin := r.Header.Get("Origin")
+		if origin == "" && len(allowed) == 1 && allowed[0] == "*" {
+			// sem origem (ex.: curl/healthz) e modo aberto
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		} else if origin != "" && isAllowed(origin) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		}
+
+		w.Header().Set("Vary", "Origin")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		// Cabeçalhos aceitos (inclui nosso header de pseudo-auth)
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-User-Email")
-		// Cache do preflight (OPTIONS)
 		w.Header().Set("Access-Control-Max-Age", "86400") // 24h
 
-		// Responde preflight sem passar adiante
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -73,27 +117,37 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-/*
-===============================================================================
+// Cabeçalhos de segurança básicos
+func securityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-XSS-Protection", "0")
+		next.ServeHTTP(w, r)
+	})
+}
 
-	Conexão com o banco
+// Protege contra panic em handlers
+func recoverMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("panic: %v", rec)
+				http.Error(w, "erro interno", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
 
--------------------------------------------------------------------------------
+//
+// =====================
+// Conexão com o banco
+// =====================
+//
 
-  - Lê DATABASE_URL do .env (ex.: postgres://user:pass@host:5432/db?sslmode=disable)
-
-  - Abre o pool `*sql.DB`, valida com `Ping()` e configura limites básicos.
-
-    Boas práticas:
-
-  - Em produção, ajuste pool conforme sua infra (máx conexões, idle, lifetime).
-
-  - Trate secrets via variáveis de ambiente (não commitar .env).
-
-===============================================================================
-*/
 func conectarBanco() *sql.DB {
-	// Carrega .env (silencioso se não existir, OK em produção)
+	// Carrega .env (silencioso se não existir)
 	_ = godotenv.Load()
 
 	connStr := os.Getenv("DATABASE_URL")
@@ -109,43 +163,39 @@ func conectarBanco() *sql.DB {
 		log.Fatal("Não foi possível conectar ao banco de dados:", err)
 	}
 
-	// 🔧 Pool básico (ajuste esses valores conforme seu ambiente)
-	db.SetMaxOpenConns(10)                 // máx conexões abertas
-	db.SetMaxIdleConns(5)                  // máx conexões ociosas
-	db.SetConnMaxLifetime(5 * time.Minute) // reciclagem de conexões
+	// Pool (parametrizável por env)
+	db.SetMaxOpenConns(getEnvAsInt("DB_MAX_OPEN_CONNS", 10))
+	db.SetMaxIdleConns(getEnvAsInt("DB_MAX_IDLE_CONNS", 5))
+	db.SetConnMaxLifetime(getEnvAsDuration("DB_CONN_MAX_LIFETIME", 5*time.Minute))
 
 	log.Println("Conectado ao banco de dados!")
 	return db
 }
 
-/*
-===============================================================================
+//
+// ==================
+// Registro de rotas
+// ==================
+//
 
-	Registro de Rotas
-
--------------------------------------------------------------------------------
-
-	Centraliza toda a definição de endpoints. Cada rota é envelopada pelo CORS
-	e chama os handlers específicos. Alguns endpoints usam middlewares de validação.
-
-===============================================================================
-*/
 func registrarRotas(mux *http.ServeMux, db *sql.DB) {
-	// ----------------------- Autenticação -----------------------
-	// POST /register → cria usuário (nome, email, senha)
-	mux.Handle("/register", corsMiddleware(handler.RegisterHandler(db)))
-	// POST /login → autentica e retorna dados básicos
-	mux.Handle("/login", corsMiddleware(handler.LoginHandler(db)))
+	// Middlewares padrão aplicados em (quase) todas as rotas
+	defaultMW := []func(http.Handler) http.Handler{
+		recoverMiddleware,
+		securityHeadersMiddleware,
+		corsMiddleware,
+	}
 
-	// -------------------- Perfil / Usuário ----------------------
-	// PUT  /api/perfil      → atualiza nome/foto (e senha opcional)
-	mux.Handle("/api/perfil", corsMiddleware(handler.AtualizarPerfilHandler(db)))
-	// GET  /api/usuario?email=... → obtém dados do usuário + tutorial_visto
-	mux.Handle("/api/usuario", corsMiddleware(handler.BuscarUsuarioPorEmailHandler(db)))
+	// ---------- Autenticação ----------
+	mux.Handle("/register", apply(handler.RegisterHandler(db), defaultMW...))
+	mux.Handle("/login", apply(handler.LoginHandler(db), defaultMW...))
 
-	// PUT /api/usuario/{id}/tutorial → marca tutorial_visto (true/false)
-	mux.Handle("/api/usuario/", corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Espera exatamente: /api/usuario/{id}/tutorial
+	// ---------- Perfil / Usuário ----------
+	mux.Handle("/api/perfil", apply(handler.AtualizarPerfilHandler(db), defaultMW...))
+	mux.Handle("/api/usuario", apply(handler.BuscarUsuarioPorEmailHandler(db), defaultMW...))
+
+	// /api/usuario/{id}/tutorial (PUT)
+	mux.Handle("/api/usuario/", apply(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/api/usuario/")
 		parts := strings.Split(strings.Trim(path, "/"), "/")
 		if len(parts) == 2 && parts[1] == "tutorial" && r.Method == http.MethodPut {
@@ -153,33 +203,28 @@ func registrarRotas(mux *http.ServeMux, db *sql.DB) {
 			return
 		}
 		http.NotFound(w, r)
-	})))
+	}), defaultMW...))
 
-	// --------------------- Validações (GET) ---------------------
-	// GET /api/estudantes/check-cpf?cpf=...&ignoreId=...
-	mux.Handle("/api/estudantes/check-cpf", corsMiddleware(handler.VerificarCpfHandler(db)))
-	// GET /api/estudantes/check-email?email=...&ignoreId=...
-	mux.Handle("/api/estudantes/check-email", corsMiddleware(handler.VerificarEmailHandler(db)))
+	// ---------- Validações ----------
+	mux.Handle("/api/estudantes/check-cpf", apply(handler.VerificarCpfHandler(db), defaultMW...))
+	mux.Handle("/api/estudantes/check-email", apply(handler.VerificarEmailHandler(db), defaultMW...))
 
-	// ------------------------ Estudantes ------------------------
-	// /api/estudantes
-	//   GET  → lista do usuário autenticado (via header X-User-Email)
-	//   POST → cria (valida e-mail do aluno via middleware sem perder o payload)
-	mux.Handle("/api/estudantes", corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// ---------- Estudantes ----------
+	// /api/estudantes (GET/POST)
+	mux.Handle("/api/estudantes", apply(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			handler.ListarEstudantesHandler(db)(w, r)
 		case http.MethodPost:
+			// mantém o middleware de validação existente
 			middleware.ValidarEstudanteEmailMiddleware(handler.CriarEstudanteHandler(db))(w, r)
 		default:
 			http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
 		}
-	})))
+	}), defaultMW...))
 
-	// /api/estudantes/{id}
-	//   PUT    → edita (também valida e-mail do aluno)
-	//   DELETE → remove
-	mux.Handle("/api/estudantes/", corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// /api/estudantes/{id} (PUT/DELETE)
+	mux.Handle("/api/estudantes/", apply(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		idStr := strings.TrimPrefix(r.URL.Path, "/api/estudantes/")
 		if idStr == "" {
 			http.Error(w, "ID não informado", http.StatusBadRequest)
@@ -197,13 +242,11 @@ func registrarRotas(mux *http.ServeMux, db *sql.DB) {
 		default:
 			http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
 		}
-	})))
+	}), defaultMW...))
 
-	// ------------------------- Anos/Turmas ----------------------
-	// /api/anos
-	//   GET  → lista anos do usuário
-	//   POST → cria novo ano para o usuário
-	mux.Handle("/api/anos", corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// ---------- Anos/Turmas ----------
+	// /api/anos (GET/POST)
+	mux.Handle("/api/anos", apply(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			handler.ListarAnosHandler(db)(w, r)
@@ -212,11 +255,10 @@ func registrarRotas(mux *http.ServeMux, db *sql.DB) {
 		default:
 			http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
 		}
-	})))
+	}), defaultMW...))
 
-	// /api/anos/{id}
-	//   DELETE → remove ano (e estudantes vinculados daquele usuário)
-	mux.Handle("/api/anos/", corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// /api/anos/{id} (DELETE)
+	mux.Handle("/api/anos/", apply(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		idStr := strings.TrimPrefix(r.URL.Path, "/api/anos/")
 		if idStr == "" {
 			http.Error(w, "ID do ano/turma não informado", http.StatusBadRequest)
@@ -232,11 +274,13 @@ func registrarRotas(mux *http.ServeMux, db *sql.DB) {
 		default:
 			http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
 		}
-	})))
+	}), defaultMW...))
 
-	// -------------------- Estáticos / Utilidades ----------------
-	// Servir uploads locais (se aplicável)
-	mux.Handle("/uploads/", http.StripPrefix("/uploads/", http.FileServer(http.Dir("./uploads"))))
+	// ---------- Estáticos / Utilidades ----------
+	// Servir uploads locais (se a pasta existir)
+	if fi, err := os.Stat("./uploads"); err == nil && fi.IsDir() {
+		mux.Handle("/uploads/", http.StripPrefix("/uploads/", http.FileServer(http.Dir("./uploads"))))
+	}
 
 	// Healthcheck simples (para Docker/CI/K8s)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -251,18 +295,12 @@ func registrarRotas(mux *http.ServeMux, db *sql.DB) {
 	}))
 }
 
-/*
-===============================================================================
+//
+// =====
+// main
+// =====
+//
 
-	main
-
--------------------------------------------------------------------------------
-  - Conecta ao banco e registra rotas no *http.ServeMux.
-  - Configura timeouts do servidor.
-  - Inicia o HTTP server e implementa graceful shutdown (SIGINT/SIGTERM).
-
-===============================================================================
-*/
 func main() {
 	// 1) Banco
 	db := conectarBanco()
@@ -272,32 +310,39 @@ func main() {
 	mux := http.NewServeMux()
 	registrarRotas(mux, db)
 
-	// 3) Servidor HTTP com timeouts (resiliência/segurança)
+	// 3) Servidor HTTP com timeouts (parametrizáveis)
+	port := getEnv("PORT", "8080")
 	server := &http.Server{
-		Addr:         ":8080",          // porta do backend
-		Handler:      mux,              // multiplexer com nossas rotas
-		ReadTimeout:  10 * time.Second, // limite leitura request
-		WriteTimeout: 15 * time.Second, // limite escrita response
-		IdleTimeout:  60 * time.Second, // keep-alive
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadTimeout:       getEnvAsDuration("HTTP_READ_TIMEOUT", 10*time.Second),
+		ReadHeaderTimeout: getEnvAsDuration("HTTP_READ_HEADER_TIMEOUT", 5*time.Second),
+		WriteTimeout:      getEnvAsDuration("HTTP_WRITE_TIMEOUT", 15*time.Second),
+		IdleTimeout:       getEnvAsDuration("HTTP_IDLE_TIMEOUT", 60*time.Second),
 	}
 
-	log.Println("Servidor rodando em http://localhost:8080")
+	log.Printf("Servidor rodando em http://localhost:%s", port)
 
-	// 4) Graceful shutdown: captura SIGINT/SIGTERM e encerra com timeout
+	// 4) Graceful shutdown: captura SIGINT/SIGTERM
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	// fecha recursos no desligamento
+	server.RegisterOnShutdown(func() {
+		_ = db.Close()
+	})
 
 	go func() {
 		<-quit
 		log.Println("Desligando o servidor...")
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), getEnvAsDuration("HTTP_SHUTDOWN_TIMEOUT", 10*time.Second))
 		defer cancel()
 		if err := server.Shutdown(ctx); err != nil {
 			log.Printf("Erro ao desligar servidor: %v", err)
 		}
 	}()
 
-	// 5) Start bloqueante (sai apenas por erro ou shutdown)
+	// 5) Start bloqueante
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Erro ao iniciar servidor: %v", err)
 	}

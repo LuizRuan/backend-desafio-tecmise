@@ -1,90 +1,82 @@
+// ============================================================================
+// 📄 handler/estudante_handler.go
+// ============================================================================
+// 🎯 Responsabilidade
+// - Handlers HTTP para estudantes: criar, listar, editar, excluir e checagens
+//   de duplicidade (CPF/E-mail).
+// - Todas as rotas exigem autenticação via Header `X-User-Email`.
 //
-// =====================================================
-// 📌 estudante_handler.go
+// 🛡️ Segurança e Escopo
+// - Todas as operações são filtradas por `usuario_id` (dono do registro).
+// - Usa o mesmo timeout de DB definido em `handler/ano_handler.go` (dbTimeout).
 //
-// 🎯 Responsabilidade:
-//    - Implementa todos os handlers HTTP relacionados a
-//      estudantes: criar, listar, editar, excluir e
-//      verificar duplicidade de CPF/E-mail.
-//    - Todas as rotas exigem autenticação do usuário
-//      via Header `X-User-Email`.
-//
-// 📦 Fluxo Geral:
-//    1. Valida o método HTTP permitido.
-//    2. Autentica usuário pelo e-mail no Header.
-//    3. Interage com o banco PostgreSQL (tabela `estudantes`).
-//    4. Retorna resposta em formato JSON.
-//
-// 🔒 Segurança:
-//    - Cada ação é vinculada ao `usuario_id`, garantindo
-//      que um usuário só manipule seus próprios estudantes.
-//
-// =====================================================
-//
+// ============================================================================
 
 package handler
 
 import (
-	"backend/model"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
+
+	"backend/model"
 
 	"github.com/lib/pq"
 )
 
-//
-// =====================================================
-// 🔹 Helpers — Respostas JSON e Mapeamento de Erros
-// =====================================================
-//
+// ==========================
+// Helpers
+// ==========================
 
-// writeJSON envia uma resposta JSON genérica
 func writeJSON(w http.ResponseWriter, status int, payload any) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-// writeJSONError envia uma resposta de erro no formato JSON
 func writeJSONError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
 // mapPQError converte erros do Postgres (pq.Error) para mensagens amigáveis
-//
-// Exemplos tratados:
-//   - 23505 (unique_violation)
-//   - CPF já cadastrado para este usuário
-//   - E-mail já cadastrado para este usuário
+// (ex.: violação de unicidade em CPF/E-mail por usuário)
 func mapPQError(err error) (status int, message string, handled bool) {
 	if err == nil {
 		return 0, "", false
 	}
-
 	if pqErr, ok := err.(*pq.Error); ok {
-		// 23505 = unique_violation
-		if string(pqErr.Code) == "23505" {
+		if string(pqErr.Code) == "23505" { // unique_violation
 			switch pqErr.Constraint {
 			case "estudantes_cpf_usuario_unique":
 				return http.StatusConflict, "CPF já cadastrado para este usuário.", true
 			case "estudantes_email_usuario_unique":
 				return http.StatusConflict, "E-mail já cadastrado para este usuário.", true
 			}
-			// fallback genérico para outras violações de unicidade
 			return http.StatusConflict, "Registro já existente (violação de unicidade).", true
 		}
 	}
-
 	return 0, "", false
 }
 
-// =====================================================
+// remove tudo que não for dígito (para checagem de CPF)
+func digitsOnly(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// =============================================
 // 🔹 Criar Estudante (POST) — /api/estudantes
-// =====================================================
+// =============================================
 //
-// • Valida corpo da requisição
 // • Exige Nome, CPF, Email e DataNascimento
 // • Insere no banco vinculado ao usuario_id
 // • Retorna o estudante criado em JSON
@@ -95,62 +87,37 @@ func CriarEstudanteHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		// 1️⃣ Decodifica corpo da requisição
-		var estudante model.Estudante
-		if err := json.NewDecoder(r.Body).Decode(&estudante); err != nil {
-			writeJSONError(w, http.StatusBadRequest, "Dados inválidos")
-			return
-		}
-
-		// 2️⃣ Recupera usuário autenticado via Header
-		email := strings.TrimSpace(r.Header.Get("X-User-Email"))
-		if email == "" {
+		// 🔐 Dono (reutiliza helper do mesmo package)
+		uid, err := usuarioIDFromHeader(db, r)
+		if err != nil {
 			writeJSONError(w, http.StatusUnauthorized, "Usuário não autenticado")
 			return
 		}
 
-		var usuarioID int
-		if err := db.QueryRow("SELECT id FROM usuarios WHERE email = $1", email).Scan(&usuarioID); err != nil {
-			writeJSONError(w, http.StatusUnauthorized, "Usuário não encontrado")
+		// 📨 Decodifica & valida (usa DTO do model)
+		var in model.EstudanteCreateRequest
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "JSON inválido")
+			return
+		}
+		in.Sanitize()
+		if err := in.Validate(); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 
-		// 3️⃣ Validação obrigatória
-		if strings.TrimSpace(estudante.Nome) == "" ||
-			strings.TrimSpace(estudante.CPF) == "" ||
-			strings.TrimSpace(estudante.Email) == "" ||
-			strings.TrimSpace(estudante.DataNascimento) == "" {
-			writeJSONError(w, http.StatusBadRequest, "Nome, CPF, email e data de nascimento são obrigatórios!")
-			return
-		}
+		ctx, cancel := context.WithTimeout(r.Context(), dbTimeout)
+		defer cancel()
 
-		// 4️⃣ Insere estudante e retorna dados criados
-		err := db.QueryRow(`
+		// 🧱 Insere e retorna o id criado
+		var novoID int
+		err = db.QueryRowContext(ctx, `
 			INSERT INTO estudantes (nome, cpf, email, data_nascimento, telefone, foto_url, ano_id, turma_id, usuario_id)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-			RETURNING id, nome, cpf, email, data_nascimento, telefone, foto_url, ano_id, turma_id
+			RETURNING id
 		`,
-			estudante.Nome,
-			estudante.CPF,
-			estudante.Email,
-			estudante.DataNascimento,
-			estudante.Telefone,
-			estudante.FotoURL,
-			estudante.AnoID,
-			estudante.TurmaID,
-			usuarioID,
-		).Scan(
-			&estudante.ID,
-			&estudante.Nome,
-			&estudante.CPF,
-			&estudante.Email,
-			&estudante.DataNascimento,
-			&estudante.Telefone,
-			&estudante.FotoURL,
-			&estudante.AnoID,
-			&estudante.TurmaID,
-		)
-
+			in.Nome, in.CPF, in.Email, in.DataNascimento, in.Telefone, in.FotoURL, in.AnoID, in.TurmaID, uid,
+		).Scan(&novoID)
 		if status, msg, ok := mapPQError(err); ok {
 			writeJSONError(w, status, msg)
 			return
@@ -160,16 +127,27 @@ func CriarEstudanteHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		// 5️⃣ Retorna o estudante criado
-		writeJSON(w, http.StatusCreated, estudante)
+		// Monta retorno compatível (sem usuario_id)
+		out := model.Estudante{
+			ID:             novoID,
+			Nome:           in.Nome,
+			CPF:            in.CPF,
+			Email:          in.Email,
+			DataNascimento: in.DataNascimento,
+			Telefone:       in.Telefone,
+			FotoURL:        in.FotoURL,
+			AnoID:          in.AnoID,
+			TurmaID:        in.TurmaID,
+		}
+		writeJSON(w, http.StatusCreated, out)
 	}
 }
 
-// =====================================================
+// ====================================================
 // 🔹 Listar Estudantes (GET) — /api/estudantes
-// =====================================================
+// ====================================================
 //
-// • Lista todos os estudantes vinculados ao usuário autenticado
+// • Lista todos os estudantes do usuário autenticado
 // • Ordena pelo ID crescente
 func ListarEstudantesHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -178,26 +156,21 @@ func ListarEstudantesHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		// 🔑 Autenticação
-		email := strings.TrimSpace(r.Header.Get("X-User-Email"))
-		if email == "" {
+		uid, err := usuarioIDFromHeader(db, r)
+		if err != nil {
 			writeJSONError(w, http.StatusUnauthorized, "Usuário não autenticado")
 			return
 		}
 
-		var usuarioID int
-		if err := db.QueryRow("SELECT id FROM usuarios WHERE email = $1", email).Scan(&usuarioID); err != nil {
-			writeJSONError(w, http.StatusUnauthorized, "Usuário não encontrado")
-			return
-		}
+		ctx, cancel := context.WithTimeout(r.Context(), dbTimeout)
+		defer cancel()
 
-		// 📥 Busca estudantes
-		rows, err := db.Query(`
+		rows, err := db.QueryContext(ctx, `
 			SELECT id, nome, cpf, email, data_nascimento, telefone, foto_url, ano_id, turma_id
 			  FROM estudantes
 			 WHERE usuario_id = $1
 			 ORDER BY id ASC
-		`, usuarioID)
+		`, uid)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "Erro ao buscar estudantes")
 			return
@@ -216,16 +189,20 @@ func ListarEstudantesHandler(db *sql.DB) http.HandlerFunc {
 			}
 			estudantes = append(estudantes, est)
 		}
+		if err := rows.Err(); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "Erro ao iterar dados")
+			return
+		}
 
 		writeJSON(w, http.StatusOK, estudantes)
 	}
 }
 
-// =====================================================
+// =========================================================
 // 🔹 Editar Estudante (PUT) — /api/estudantes/{id}
-// =====================================================
+// =========================================================
 //
-// • Valida campos obrigatórios
+// • Valida campos obrigatórios (mantém contrato atual)
 // • Atualiza dados apenas se pertencer ao usuário
 func EditarEstudanteHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -234,51 +211,43 @@ func EditarEstudanteHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		// 🔑 Autenticação
-		email := strings.TrimSpace(r.Header.Get("X-User-Email"))
-		if email == "" {
+		uid, err := usuarioIDFromHeader(db, r)
+		if err != nil {
 			writeJSONError(w, http.StatusUnauthorized, "Usuário não autenticado")
 			return
 		}
 
-		var usuarioID int
-		if err := db.QueryRow("SELECT id FROM usuarios WHERE email = $1", email).Scan(&usuarioID); err != nil {
-			writeJSONError(w, http.StatusUnauthorized, "Usuário não encontrado")
-			return
-		}
-
-		// 🔎 Extrai ID do path
+		// ID do path
 		idStr := strings.TrimPrefix(r.URL.Path, "/api/estudantes/")
-		if idStr == "" {
-			writeJSONError(w, http.StatusBadRequest, "ID do estudante não informado")
+		id, err := strconv.Atoi(strings.TrimSpace(idStr))
+		if err != nil || id <= 0 {
+			writeJSONError(w, http.StatusBadRequest, "ID do estudante inválido")
 			return
 		}
 
-		// 📥 Decodifica body
-		var estudante model.Estudante
-		if err := json.NewDecoder(r.Body).Decode(&estudante); err != nil {
-			writeJSONError(w, http.StatusBadRequest, "Dados inválidos")
+		// Decodifica & valida (usamos DTO de criação para manter "todos obrigatórios")
+		var in model.EstudanteCreateRequest
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "JSON inválido")
+			return
+		}
+		in.Sanitize()
+		if err := in.Validate(); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 
-		// ✅ Validação
-		if strings.TrimSpace(estudante.Nome) == "" ||
-			strings.TrimSpace(estudante.CPF) == "" ||
-			strings.TrimSpace(estudante.Email) == "" ||
-			strings.TrimSpace(estudante.DataNascimento) == "" {
-			writeJSONError(w, http.StatusBadRequest, "Nome, CPF, email e data de nascimento são obrigatórios!")
-			return
-		}
+		ctx, cancel := context.WithTimeout(r.Context(), dbTimeout)
+		defer cancel()
 
-		// ✏️ Atualização
-		_, err := db.Exec(`
+		res, err := db.ExecContext(ctx, `
 			UPDATE estudantes
 			   SET nome=$1, cpf=$2, email=$3, data_nascimento=$4, telefone=$5, foto_url=$6, ano_id=$7, turma_id=$8
 			 WHERE id=$9 AND usuario_id=$10
 		`,
-			estudante.Nome, estudante.CPF, estudante.Email, estudante.DataNascimento,
-			estudante.Telefone, estudante.FotoURL, estudante.AnoID, estudante.TurmaID,
-			idStr, usuarioID,
+			in.Nome, in.CPF, in.Email, in.DataNascimento,
+			in.Telefone, in.FotoURL, in.AnoID, in.TurmaID,
+			id, uid,
 		)
 		if status, msg, ok := mapPQError(err); ok {
 			writeJSONError(w, status, msg)
@@ -288,14 +257,18 @@ func EditarEstudanteHandler(db *sql.DB) http.HandlerFunc {
 			writeJSONError(w, http.StatusInternalServerError, "Erro ao editar estudante")
 			return
 		}
+		if rows, _ := res.RowsAffected(); rows == 0 {
+			writeJSONError(w, http.StatusNotFound, "Estudante não encontrado")
+			return
+		}
 
 		writeJSON(w, http.StatusOK, map[string]string{"message": "Estudante editado com sucesso"})
 	}
 }
 
-// =====================================================
+// ==========================================================
 // 🔹 Remover Estudante (DELETE) — /api/estudantes/{id}
-// =====================================================
+// ==========================================================
 //
 // • Exclui estudante apenas se pertencer ao usuário
 func RemoverEstudanteHandler(db *sql.DB) http.HandlerFunc {
@@ -305,28 +278,23 @@ func RemoverEstudanteHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		// 🔑 Autenticação
-		email := strings.TrimSpace(r.Header.Get("X-User-Email"))
-		if email == "" {
+		uid, err := usuarioIDFromHeader(db, r)
+		if err != nil {
 			writeJSONError(w, http.StatusUnauthorized, "Usuário não autenticado")
 			return
 		}
 
-		var usuarioID int
-		if err := db.QueryRow("SELECT id FROM usuarios WHERE email = $1", email).Scan(&usuarioID); err != nil {
-			writeJSONError(w, http.StatusUnauthorized, "Usuário não encontrado")
-			return
-		}
-
-		// 🔎 Extrai ID
 		idStr := strings.TrimPrefix(r.URL.Path, "/api/estudantes/")
-		if idStr == "" {
-			writeJSONError(w, http.StatusBadRequest, "ID do estudante não informado")
+		id, err := strconv.Atoi(strings.TrimSpace(idStr))
+		if err != nil || id <= 0 {
+			writeJSONError(w, http.StatusBadRequest, "ID do estudante inválido")
 			return
 		}
 
-		// 🗑️ Exclusão
-		res, err := db.Exec(`DELETE FROM estudantes WHERE id = $1 AND usuario_id = $2`, idStr, usuarioID)
+		ctx, cancel := context.WithTimeout(r.Context(), dbTimeout)
+		defer cancel()
+
+		res, err := db.ExecContext(ctx, `DELETE FROM estudantes WHERE id=$1 AND usuario_id=$2`, id, uid)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "Erro ao excluir estudante")
 			return
@@ -340,13 +308,12 @@ func RemoverEstudanteHandler(db *sql.DB) http.HandlerFunc {
 	}
 }
 
-// =====================================================
+// =============================================================
 // 🔹 Verificar CPF duplicado (GET)
-// =====================================================
 //
-// • Endpoint: /api/estudantes/check-cpf?cpf=...&ignoreId=...
-// • Útil para validação em tempo real no frontend
-// • Aceita ignoreId/excludeId para edição
+//	/api/estudantes/check-cpf?cpf=...&ignoreId=...
+//
+// =============================================================
 func VerificarCpfHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -354,55 +321,46 @@ func VerificarCpfHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		// 🔑 Autenticação
-		email := strings.TrimSpace(r.Header.Get("X-User-Email"))
-		if email == "" {
+		uid, err := usuarioIDFromHeader(db, r)
+		if err != nil {
 			http.Error(w, "Usuário não autenticado", http.StatusUnauthorized)
 			return
 		}
 
-		var usuarioID int
-		if err := db.QueryRow("SELECT id FROM usuarios WHERE email=$1", email).Scan(&usuarioID); err != nil {
-			http.Error(w, "Usuário não encontrado", http.StatusUnauthorized)
-			return
-		}
-
-		// 📥 Params
-		cpf := strings.TrimSpace(r.URL.Query().Get("cpf"))
+		cpf := digitsOnly(strings.TrimSpace(r.URL.Query().Get("cpf")))
 		ignoreID := strings.TrimSpace(r.URL.Query().Get("ignoreId"))
 		if ignoreID == "" {
 			ignoreID = strings.TrimSpace(r.URL.Query().Get("excludeId"))
 		}
-
 		if cpf == "" {
-			http.Error(w, `{"error":"cpf é obrigatório"}`, http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, "cpf é obrigatório")
 			return
 		}
 
-		// 🔎 Verificação
+		ctx, cancel := context.WithTimeout(r.Context(), dbTimeout)
+		defer cancel()
+
 		query := `SELECT 1 FROM estudantes WHERE usuario_id=$1 AND cpf=$2`
-		args := []interface{}{usuarioID, cpf}
+		args := []any{uid, cpf}
 		if ignoreID != "" {
 			query += ` AND id<>$3`
 			args = append(args, ignoreID)
 		}
 
 		var dummy int
-		err := db.QueryRow(query, args...).Scan(&dummy)
+		err = db.QueryRowContext(ctx, query, args...).Scan(&dummy)
 		exists := (err == nil)
 
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]bool{"exists": exists})
+		writeJSON(w, http.StatusOK, map[string]bool{"exists": exists})
 	}
 }
 
-// =====================================================
+// =============================================================
 // 🔹 Verificar E-mail duplicado (GET)
-// =====================================================
 //
-// • Endpoint: /api/estudantes/check-email?email=...&ignoreId=...
-// • Aceita ignoreId/excludeId (edição)
-// • Comparação case-insensitive (LOWER)
+//	/api/estudantes/check-email?email=...&ignoreId=...
+//
+// =============================================================
 func VerificarEmailHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -410,44 +368,36 @@ func VerificarEmailHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		// 🔑 Autenticação
-		emailHeader := strings.TrimSpace(r.Header.Get("X-User-Email"))
-		if emailHeader == "" {
+		uid, err := usuarioIDFromHeader(db, r)
+		if err != nil {
 			http.Error(w, "Usuário não autenticado", http.StatusUnauthorized)
 			return
 		}
 
-		var usuarioID int
-		if err := db.QueryRow("SELECT id FROM usuarios WHERE email=$1", emailHeader).Scan(&usuarioID); err != nil {
-			http.Error(w, "Usuário não encontrado", http.StatusUnauthorized)
-			return
-		}
-
-		// 📥 Params
 		emailParam := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("email")))
 		ignoreID := strings.TrimSpace(r.URL.Query().Get("ignoreId"))
 		if ignoreID == "" {
 			ignoreID = strings.TrimSpace(r.URL.Query().Get("excludeId"))
 		}
-
 		if emailParam == "" {
-			http.Error(w, `{"error":"email é obrigatório"}`, http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, "email é obrigatório")
 			return
 		}
 
-		// 🔎 Verificação
+		ctx, cancel := context.WithTimeout(r.Context(), dbTimeout)
+		defer cancel()
+
 		query := `SELECT 1 FROM estudantes WHERE usuario_id=$1 AND LOWER(email)=LOWER($2)`
-		args := []any{usuarioID, emailParam}
+		args := []any{uid, emailParam}
 		if ignoreID != "" {
 			query += ` AND id<>$3`
 			args = append(args, ignoreID)
 		}
 
 		var dummy int
-		err := db.QueryRow(query, args...).Scan(&dummy)
+		err = db.QueryRowContext(ctx, query, args...).Scan(&dummy)
 		exists := (err == nil)
 
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]bool{"exists": exists})
+		writeJSON(w, http.StatusOK, map[string]bool{"exists": exists})
 	}
 }

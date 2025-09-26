@@ -1,18 +1,12 @@
 // backend/middleware/validacao.go
 //
-// 🔹 Objetivo deste arquivo:
-//
-//	Reunir middlewares de **validação de entrada** para os fluxos de cadastro, login
-//	e criação/edição de estudantes. Garantem que os dados recebidos pela API
-//	estejam corretos, normalizados e consistentes, antes de serem processados
-//	pelos handlers principais.
-//
-// ===============================================================
-// 📌 Estruturas de Request
-// ===============================================================
-//
-// RegisterRequest → usado no fluxo de cadastro de usuários
-// LoginRequest    → usado no fluxo de login de usuários
+// 🔹 Objetivo:
+// Middlewares de validação/saneamento para cadastro, login e email do estudante.
+// Mantém comportamento (status 400 e mensagens em texto) e reduz duplicação.
+// - Reutiliza DTOs e regras do package model (RegisterRequest, LoginRequest, MinPasswordLen)
+// - Usa net/mail para validação de e-mail (mais robusto que regex)
+// - Reinsere o corpo normalizado sem conversões desnecessárias
+
 package middleware
 
 import (
@@ -20,67 +14,73 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"regexp"
+	"net/mail"
 	"strings"
+
+	"backend/model"
 )
 
-// Estrutura usada no cadastro de usuário
-type RegisterRequest struct {
-	Nome  string `json:"nome"`
-	Email string `json:"email"`
-	Senha string `json:"senha"`
+// Limite de corpo lido (proteção básica contra payloads gigantes)
+const maxBodySize = 1 << 20 // 1 MiB
+
+// ------------------------ helpers ------------------------
+
+func normalizeEmail(raw string) (string, error) {
+	email := strings.TrimSpace(raw)
+	if email == "" {
+		return "", http.ErrNoLocation // só para sinalizar vazio; tratamos fora
+	}
+	// Não aceitamos espaços internos
+	if strings.Contains(email, " ") {
+		return "", http.ErrUseLastResponse // marcador genérico
+	}
+	// Validação RFC-ish
+	if _, err := mail.ParseAddress(email); err != nil {
+		return "", err
+	}
+	// Normalização comum: minúsculas
+	return strings.ToLower(email), nil
 }
 
-// Estrutura usada no login de usuário
-type LoginRequest struct {
-	Email string `json:"email"`
-	Senha string `json:"senha"`
-}
+// ---------------------- Middlewares ----------------------
 
-// ===============================================================
-// 📌 Middleware: Validação de Cadastro
-// ===============================================================
-//
-// Regras aplicadas:
-//   - Nome → não pode ser vazio, mínimo de 2 caracteres
-//   - E-mail → sem espaços, sem espaços nas bordas, formato válido
-//   - Senha → mínimo 8 caracteres, sem espaços
-//
-// Após validação, substitui o corpo da requisição pelo JSON corrigido.
-// Assim, o handler seguinte recebe os dados normalizados.
+// ValidarCadastroMiddleware valida o payload de cadastro de usuário.
+// Regras: nome ≥ 2, email válido, senha ≥ MinPasswordLen e sem espaços.
 func ValidarCadastroMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var req RegisterRequest
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+		defer r.Body.Close()
+
+		var req model.RegisterRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "JSON inválido", http.StatusBadRequest)
 			return
 		}
 
-		// === Nome ===
+		// Nome
 		req.Nome = strings.TrimSpace(req.Nome)
 		if len(req.Nome) < 2 {
 			http.Error(w, "Nome muito curto", http.StatusBadRequest)
 			return
 		}
 
-		// === E-mail ===
-		if req.Email == "" || req.Email != strings.TrimSpace(req.Email) {
-			http.Error(w, "E-mail não pode começar ou terminar com espaço!", http.StatusBadRequest)
+		// E-mail
+		normEmail, err := normalizeEmail(req.Email)
+		if err != nil {
+			// mensagens mais amigáveis (sem mudar status/mídia)
+			switch {
+			case err == http.ErrNoLocation:
+				http.Error(w, "E-mail é obrigatório", http.StatusBadRequest)
+			default:
+				http.Error(w, "E-mail inválido", http.StatusBadRequest)
+			}
 			return
 		}
-		if strings.Contains(req.Email, " ") {
-			http.Error(w, "E-mail não pode conter espaços!", http.StatusBadRequest)
-			return
-		}
-		emailRe := regexp.MustCompile(`^[\w\-.]+@([\w-]+\.)+[\w-]{2,4}$`)
-		if !emailRe.MatchString(req.Email) {
-			http.Error(w, "E-mail inválido", http.StatusBadRequest)
-			return
-		}
+		req.Email = normEmail
 
-		// === Senha ===
-		if req.Senha == "" || len(req.Senha) < 8 {
-			http.Error(w, "Senha muito curta (mínimo 8 caracteres)", http.StatusBadRequest)
+		// Senha
+		if len(req.Senha) < model.MinPasswordLen {
+			http.Error(w, "Senha muito curta (mínimo "+strconvI(model.MinPasswordLen)+" caracteres)", http.StatusBadRequest)
 			return
 		}
 		if strings.Contains(req.Senha, " ") {
@@ -90,47 +90,41 @@ func ValidarCadastroMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 		// Reinsere JSON corrigido no corpo
 		bodyBytes, _ := json.Marshal(req)
-		r.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 
 		next(w, r)
 	}
 }
 
-// ===============================================================
-// 📌 Middleware: Validação de Login
-// ===============================================================
-//
-// Regras aplicadas:
-//   - E-mail → não pode conter espaços, nem bordas com espaços, formato válido
-//   - Senha  → mínimo de 8 caracteres, sem espaços
-//
-// Normaliza o JSON e reenvia para o handler.
+// ValidarLoginMiddleware valida o payload de login.
+// Regras: email válido e senha ≥ MinPasswordLen, sem espaços.
 func ValidarLoginMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var req LoginRequest
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+		defer r.Body.Close()
+
+		var req model.LoginRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "JSON inválido", http.StatusBadRequest)
 			return
 		}
 
-		// === E-mail ===
-		if req.Email == "" || req.Email != strings.TrimSpace(req.Email) {
-			http.Error(w, "E-mail não pode começar ou terminar com espaço!", http.StatusBadRequest)
+		// E-mail
+		normEmail, err := normalizeEmail(req.Email)
+		if err != nil {
+			switch {
+			case err == http.ErrNoLocation:
+				http.Error(w, "E-mail é obrigatório", http.StatusBadRequest)
+			default:
+				http.Error(w, "E-mail inválido", http.StatusBadRequest)
+			}
 			return
 		}
-		if strings.Contains(req.Email, " ") {
-			http.Error(w, "E-mail não pode conter espaços!", http.StatusBadRequest)
-			return
-		}
-		emailRe := regexp.MustCompile(`^[\w\-.]+@([\w-]+\.)+[\w-]{2,4}$`)
-		if !emailRe.MatchString(req.Email) {
-			http.Error(w, "E-mail inválido", http.StatusBadRequest)
-			return
-		}
+		req.Email = normEmail
 
-		// === Senha ===
-		if req.Senha == "" || len(req.Senha) < 8 {
-			http.Error(w, "Senha deve ter pelo menos 8 caracteres.", http.StatusBadRequest)
+		// Senha
+		if len(req.Senha) < model.MinPasswordLen {
+			http.Error(w, "Senha deve ter pelo menos "+strconvI(model.MinPasswordLen)+" caracteres.", http.StatusBadRequest)
 			return
 		}
 		if strings.Contains(req.Senha, " ") {
@@ -140,72 +134,64 @@ func ValidarLoginMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 		// Reinsere JSON corrigido no corpo
 		bodyBytes, _ := json.Marshal(req)
-		r.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 
 		next(w, r)
 	}
 }
 
-// ===============================================================
-// 📌 Middleware: Validação de E-mail do Estudante
-// ===============================================================
-//
-// 🔹 Objetivo:
-//   - Valida apenas o campo "email" do estudante
-//   - Não interfere em outros campos (nome, cpf, data_nascimento, etc.)
-//   - Preserva o JSON completo enviado pelo frontend
-//
-// 🔹 Regras aplicadas:
-//   - Campo "email" obrigatório
-//   - Não pode conter espaços
-//   - Deve estar em formato válido
-//
-// 🔹 Fluxo:
-//  1. Lê corpo original
-//  2. Decodifica em `map[string]any` (preserva campos extras)
-//  3. Valida e normaliza e-mail
-//  4. Reconstrói JSON e envia para o próximo handler
+// ValidarEstudanteEmailMiddleware valida somente o campo "email" do estudante,
+// preservando o JSON original (campos extras são mantidos).
 func ValidarEstudanteEmailMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// 1) Lê corpo original
-		orig, err := io.ReadAll(r.Body)
+		defer r.Body.Close()
+		orig, err := io.ReadAll(io.LimitReader(r.Body, maxBodySize))
 		if err != nil {
 			http.Error(w, "Falha ao ler corpo da requisição", http.StatusBadRequest)
 			return
 		}
-		defer r.Body.Close()
 
-		// 2) Deserializa para map genérico
+		// Preserva o payload como map genérico
 		var payload map[string]any
 		if err := json.Unmarshal(orig, &payload); err != nil {
 			http.Error(w, "JSON inválido", http.StatusBadRequest)
 			return
 		}
 
-		// 3) Extrai e valida campo "email"
 		rawEmail, _ := payload["email"].(string)
-		email := strings.TrimSpace(rawEmail)
-
-		if email == "" {
-			http.Error(w, "E-mail do estudante é obrigatório", http.StatusBadRequest)
-			return
-		}
-		if strings.Contains(email, " ") {
-			http.Error(w, "E-mail do estudante não pode conter espaços", http.StatusBadRequest)
-			return
-		}
-		emailRe := regexp.MustCompile(`^[\w\-.]+@([\w-]+\.)+[\w-]{2,4}$`)
-		if !emailRe.MatchString(email) {
-			http.Error(w, "E-mail do estudante inválido", http.StatusBadRequest)
+		normEmail, err := normalizeEmail(rawEmail)
+		if err != nil {
+			switch {
+			case err == http.ErrNoLocation:
+				http.Error(w, "E-mail do estudante é obrigatório", http.StatusBadRequest)
+			default:
+				http.Error(w, "E-mail do estudante inválido", http.StatusBadRequest)
+			}
 			return
 		}
 
-		// 4) Normaliza e reinsere
-		payload["email"] = email
+		// Atualiza somente o campo email e segue
+		payload["email"] = normEmail
 		normBody, _ := json.Marshal(payload)
-
-		// 5) Reatribui corpo e segue para o handler
 		r.Body = io.NopCloser(bytes.NewReader(normBody))
+
 		next(w, r)
 	}
+}
+
+// strconvI converte int para string sem importar strconv inteiro
+func strconvI(n int) string {
+	// pequena função inline para evitar importar strconv só por isso
+	const digits = "0123456789"
+	if n == 0 {
+		return "0"
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = digits[n%10]
+		n /= 10
+	}
+	return string(b[i:])
 }
