@@ -1,8 +1,24 @@
+/*
+/// Projeto: Tecmise
+/// Arquivo: backend/model/estudante.go
+/// Responsabilidade: Definir modelo e DTOs de Estudante com rotinas de saneamento e validação leves (compatíveis com o contrato JSON do frontend).
+/// Dependências principais: time (parse ISO date), net/mail (validação básica de e-mail), unicode/strings (saneamento).
+/// Pontos de atenção:
+/// - CPF: valida apenas quantidade de dígitos (11). Não executa validação de dígitos verificadores (DV).
+/// - Data de nascimento: aceita formato ISO (YYYY-MM-DD) via time.Parse; não verifica coerência (ex.: datas futuras).
+/// - E-mail: usa mail.ParseAddress (permissivo) e não restringe provedores.
+/// - Referências de erro: ErrNomeObrigatorio e ErrEmailInvalido são esperadas em model/user.go.
+/// - Sanitize/Validate não normalizam telefone (apenas trim); regras de formatação podem variar por região.
+/// - Tipos Update usam ponteiros para diferenciar "campo não enviado" de "limpar para string vazia".
+*/
+
+//
 // backend/model/estudante.go
 //
 // 🔹 Objetivo:
 // Definir os DTOs e o modelo de Estudante, com funções de saneamento e
 // validação leves (sem quebrar o contrato JSON usado pelo frontend).
+//
 
 package model
 
@@ -14,11 +30,16 @@ import (
 	"unicode"
 )
 
+/// ============ Tipos & Interfaces ============
+
 // ===============================================================
 // 📌 Estrutura Estudante (persistido/retorno da API)
 // ---------------------------------------------------------------
 // Mantém exatamente os mesmos nomes e tags JSON do seu projeto.
 // ===============================================================
+
+// Estudante representa o registro persistido e também o payload de resposta
+// exposto pela API. As tags JSON são contratuais com o frontend.
 type Estudante struct {
 	ID             int    `json:"id"`              // Identificador único do estudante
 	Nome           string `json:"nome"`            // Nome completo
@@ -32,12 +53,16 @@ type Estudante struct {
 	UsuarioID      int    `json:"usuario_id"`      // Usuário dono do registro
 }
 
+/// ============ DTOs (criação/atualização) ============
+
 // ===============================================================
 // DTOs para criação/atualização
 // ---------------------------------------------------------------
 // Mantêm compatibilidade e permitem handlers mais limpos.
 // ===============================================================
 
+// EstudanteCreateRequest define o payload esperado para criação de estudante.
+// Use Sanitize() antes de Validate() para normalizar os campos.
 type EstudanteCreateRequest struct {
 	Nome           string `json:"nome"`
 	CPF            string `json:"cpf"`
@@ -50,6 +75,9 @@ type EstudanteCreateRequest struct {
 	UsuarioID      int    `json:"usuario_id"`
 }
 
+// EstudanteUpdateRequest define um payload parcial de atualização.
+// Campos como ponteiros permitem diferenciar ausência de campo (nil)
+// de intenção de esvaziar (ex.: string vazia).
 type EstudanteUpdateRequest struct {
 	Nome           *string `json:"nome,omitempty"`
 	CPF            *string `json:"cpf,omitempty"`
@@ -61,6 +89,8 @@ type EstudanteUpdateRequest struct {
 	TurmaID        *int    `json:"turma_id,omitempty"`
 	UsuarioID      *int    `json:"usuario_id,omitempty"`
 }
+
+/// ============ Configurações & Constantes ============
 
 // ===============================================================
 // Saneamento e Validação
@@ -77,7 +107,9 @@ var (
 	ErrDataNascimentoInvalida = errors.New("data_nascimento inválida (esperado YYYY-MM-DD)")
 )
 
-// remove tudo que não for dígito
+/// ============ Funções Internas (helpers) ============
+
+// digitsOnly remove todos os caracteres não numéricos de uma string.
 func digitsOnly(s string) string {
 	return strings.Map(func(r rune) rune {
 		if unicode.IsDigit(r) {
@@ -87,6 +119,7 @@ func digitsOnly(s string) string {
 	}, s)
 }
 
+// isValidISODate verifica se a string representa uma data válida no layout ISO (YYYY-MM-DD).
 func isValidISODate(s string) bool {
 	if len(strings.TrimSpace(s)) == 0 {
 		return false
@@ -95,8 +128,14 @@ func isValidISODate(s string) bool {
 	return err == nil
 }
 
+/// ============ Funções Públicas ============
+
 // --- Create: Sanitize/Validate ---
 
+// Sanitize padroniza espaços e caixa dos campos de criação:
+// - Trim em Nome, DataNascimento, Telefone, FotoURL
+// - Apenas dígitos em CPF
+// - E-mail para minúsculas e trim
 func (r *EstudanteCreateRequest) Sanitize() {
 	r.Nome = strings.TrimSpace(r.Nome)
 	r.CPF = digitsOnly(r.CPF)
@@ -106,6 +145,11 @@ func (r *EstudanteCreateRequest) Sanitize() {
 	r.FotoURL = strings.TrimSpace(r.FotoURL)
 }
 
+// Validate executa verificações mínimas de negócio para criação:
+// - Nome obrigatório
+// - CPF com 11 dígitos
+// - E-mail válido (mail.ParseAddress)
+// - Data de nascimento em formato ISO
 func (r EstudanteCreateRequest) Validate() error {
 	if strings.TrimSpace(r.Nome) == "" {
 		return ErrNomeObrigatorio
@@ -124,6 +168,8 @@ func (r EstudanteCreateRequest) Validate() error {
 
 // --- Update: Sanitize/Validate (só valida o que vier no payload) ---
 
+// Sanitize normaliza apenas os campos presentes (não-nil) no payload de atualização.
+// Observação: IDs (AnoID/TurmaID/UsuarioID) são inteiros e não exigem saneamento textual.
 func (r *EstudanteUpdateRequest) Sanitize() {
 	if r.Nome != nil {
 		v := strings.TrimSpace(*r.Nome)
@@ -152,6 +198,8 @@ func (r *EstudanteUpdateRequest) Sanitize() {
 	// AnoID/TurmaID/UsuarioID: inteiros, nada a sanitizar
 }
 
+// Validate verifica os campos informados (não-nil) no payload parcial de update.
+// Mantém as mesmas regras do create onde aplicável.
 func (r EstudanteUpdateRequest) Validate() error {
 	if r.Nome != nil && strings.TrimSpace(*r.Nome) == "" {
 		return ErrNomeObrigatorio
@@ -170,12 +218,16 @@ func (r EstudanteUpdateRequest) Validate() error {
 	return nil
 }
 
+/// ============ Helpers de conversão (opcional) ============
+
 // ===============================================================
 // Helpers de conversão (opcional)
 // ---------------------------------------------------------------
 // Úteis quando o handler quiser transformar o DTO em model.Estudante.
 // ===============================================================
 
+// ToModel converte um EstudanteCreateRequest para a entidade Estudante.
+// Não atribui ID (geralmente é responsabilidade da camada de persistência).
 func (r EstudanteCreateRequest) ToModel() Estudante {
 	return Estudante{
 		Nome:           r.Nome,
@@ -190,6 +242,8 @@ func (r EstudanteCreateRequest) ToModel() Estudante {
 	}
 }
 
+// ApplyTo aplica os campos presentes (não-nil) de um EstudanteUpdateRequest
+// sobre uma instância existente de Estudante (mutação in-place).
 func (u EstudanteUpdateRequest) ApplyTo(e *Estudante) {
 	if u.Nome != nil {
 		e.Nome = *u.Nome
@@ -219,3 +273,6 @@ func (u EstudanteUpdateRequest) ApplyTo(e *Estudante) {
 		e.UsuarioID = *u.UsuarioID
 	}
 }
+
+// TODO: considerar regras adicionais de negócio (ex.: impedir datas futuras, validar formato E.164 para telefone, validar DV do CPF)
+// TODO: se necessário, internacionalizar mensagens de erro (i18n) mantendo contrato da API

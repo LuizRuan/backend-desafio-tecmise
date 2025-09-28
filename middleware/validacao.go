@@ -1,3 +1,17 @@
+/*
+/// Projeto: Tecmise
+/// Arquivo: backend/middleware/validacao.go
+/// Responsabilidade: Middlewares HTTP para saneamento e validação de payloads de cadastro, login e e-mail de estudante.
+/// Dependências principais: net/http, net/mail, encoding/json, backend/model (DTOs e MinPasswordLen).
+/// Pontos de atenção:
+/// - Reatribuição de r.Body após defer Close: o defer fecha o body original; o novo NopCloser não é fechado explicitamente (memória, sem fd).
+/// - normalizeEmail usa http.ErrNoLocation/ErrUseLastResponse como sentinelas; são reaproveitados apenas como marcadores internos.
+/// - Limites de tamanho: Login/Cadastro usam MaxBytesReader; o middleware do estudante usa LimitReader (comportamentos levemente distintos).
+/// - Mensagens de erro são em texto simples (http.Error) e status 400, compatíveis com os handlers existentes.
+/// - Divergência possível com frontend: comprimento mínimo de senha no frontend pode ser maior do que model.MinPasswordLen.
+*/
+
+//
 // backend/middleware/validacao.go
 //
 // 🔹 Objetivo:
@@ -6,6 +20,7 @@
 // - Reutiliza DTOs e regras do package model (RegisterRequest, LoginRequest, MinPasswordLen)
 // - Usa net/mail para validação de e-mail (mais robusto que regex)
 // - Reinsere o corpo normalizado sem conversões desnecessárias
+//
 
 package middleware
 
@@ -20,11 +35,24 @@ import (
 	"backend/model"
 )
 
+/// ============ Configurações & Constantes ============
+
 // Limite de corpo lido (proteção básica contra payloads gigantes)
 const maxBodySize = 1 << 20 // 1 MiB
 
-// ------------------------ helpers ------------------------
+/// ============ Funções Internas (helpers) ============
 
+// normalizeEmail normaliza e valida um endereço de e-mail.
+// Regras:
+//   - Trim de espaços nas bordas.
+//   - Rejeita vazio (retorna http.ErrNoLocation como sentinela).
+//   - Rejeita espaços internos.
+//   - Valida com mail.ParseAddress.
+//   - Converte para minúsculas.
+//
+// Retorno:
+//   - string com e-mail normalizado (lowercase) e erro nulo em caso de sucesso.
+//   - erro sentinela (http.ErrNoLocation, http.ErrUseLastResponse) ou erro de ParseAddress em falhas.
 func normalizeEmail(raw string) (string, error) {
 	email := strings.TrimSpace(raw)
 	if email == "" {
@@ -42,10 +70,15 @@ func normalizeEmail(raw string) (string, error) {
 	return strings.ToLower(email), nil
 }
 
-// ---------------------- Middlewares ----------------------
+/// ============ Middlewares ============
 
 // ValidarCadastroMiddleware valida o payload de cadastro de usuário.
-// Regras: nome ≥ 2, email válido, senha ≥ MinPasswordLen e sem espaços.
+// Regras aplicadas:
+//   - Nome: trim e tamanho mínimo (2).
+//   - E-mail: normalizeEmail (trim, validação RFC-ish, lowercase).
+//   - Senha: comprimento mínimo model.MinPasswordLen e sem espaços.
+//
+// Em sucesso, reescreve o corpo com o JSON normalizado e chama o próximo handler.
 func ValidarCadastroMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
@@ -97,7 +130,11 @@ func ValidarCadastroMiddleware(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // ValidarLoginMiddleware valida o payload de login.
-// Regras: email válido e senha ≥ MinPasswordLen, sem espaços.
+// Regras aplicadas:
+//   - E-mail: normalizeEmail.
+//   - Senha: comprimento mínimo model.MinPasswordLen e sem espaços.
+//
+// Em sucesso, reescreve o corpo com o JSON normalizado e chama o próximo handler.
 func ValidarLoginMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
@@ -142,6 +179,7 @@ func ValidarLoginMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 // ValidarEstudanteEmailMiddleware valida somente o campo "email" do estudante,
 // preservando o JSON original (campos extras são mantidos).
+// Em sucesso, substitui apenas o valor normalizado de "email" e encaminha ao próximo handler.
 func ValidarEstudanteEmailMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
@@ -179,7 +217,10 @@ func ValidarEstudanteEmailMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// strconvI converte int para string sem importar strconv inteiro
+/// ============ Helpers ============
+
+// strconvI converte int para string sem importar strconv inteiro.
+// Implementação simples (base 10) para mensagens dinâmicas.
 func strconvI(n int) string {
 	// pequena função inline para evitar importar strconv só por isso
 	const digits = "0123456789"

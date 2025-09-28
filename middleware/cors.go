@@ -1,3 +1,16 @@
+/*
+/// Projeto: Tecmise
+/// Arquivo: backend/middleware/cors.go
+/// Responsabilidade: Middleware CORS configurável por variáveis de ambiente (origens, métodos, cabeçalhos, credenciais, max-age).
+/// Dependências principais: net/http, os, strings.
+/// Pontos de atenção:
+/// - Este middleware pode coexistir com o CORS inline definido em main.go; evite duplicidade ao aplicar ambos.
+/// - Quando CORS_ALLOW_CREDENTIALS=true, Access-Control-Allow-Origin nunca será "*" (espelha a Origin permitida).
+/// - Cabeçalhos expostos (Access-Control-Expose-Headers) não são definidos; adicionar se o frontend precisar ler headers custom.
+/// - Header "Vary: Origin" é adicionado; útil para caches, mas duplicações podem ocorrer se outro CORS também adicioná-lo.
+*/
+
+//
 // backend/middleware/cors.go
 //
 // Middleware CORS configurável por ambiente.
@@ -21,6 +34,12 @@ import (
 	"strings"
 )
 
+/// ============ Configurações & Constantes ============
+
+/**
+ * getEnv retorna o valor da variável de ambiente (trim) ou um default se vazia/ausente.
+ * Uso: leitura de configurações CORS (origens, métodos, cabeçalhos, etc.).
+ */
 func getEnv(k, def string) string {
 	if v := strings.TrimSpace(os.Getenv(k)); v != "" {
 		return v
@@ -28,6 +47,10 @@ func getEnv(k, def string) string {
 	return def
 }
 
+/**
+ * splitCSV divide uma string por vírgulas em itens não vazios já "trimados".
+ * Ex.: "https://a.com, https://b.com" -> []string{"https://a.com","https://b.com"}
+ */
 func splitCSV(s string) []string {
 	parts := strings.Split(s, ",")
 	out := make([]string, 0, len(parts))
@@ -40,6 +63,13 @@ func splitCSV(s string) []string {
 	return out
 }
 
+/**
+ * originAllowed verifica se uma origem é aceita pela lista configurada.
+ * Regras:
+ * - Lista vazia -> false
+ * - Primeiro item "*" -> qualquer origem permitida
+ * - Caso contrário, compara igualdade literal com a Origin recebida
+ */
 func originAllowed(origin string, allowed []string) bool {
 	if len(allowed) == 0 {
 		return false
@@ -55,7 +85,24 @@ func originAllowed(origin string, allowed []string) bool {
 	return false
 }
 
-// Cors adiciona cabeçalhos CORS e trata pré-flight (OPTIONS).
+/// ============ Funções Públicas (Middlewares) ============
+
+/**
+ * Cors adiciona cabeçalhos CORS e trata requisições de pré-flight (OPTIONS).
+ *
+ * Variáveis de ambiente suportadas:
+ * - CORS_ALLOW_ORIGINS (CSV ou "*")
+ * - CORS_ALLOW_METHODS (default: "GET, POST, PUT, DELETE, OPTIONS")
+ * - CORS_ALLOW_HEADERS (default: "Content-Type, X-User-Email")
+ * - CORS_MAX_AGE (segundos como string, default: "86400")
+ * - CORS_ALLOW_CREDENTIALS ("true" para habilitar credenciais)
+ *
+ * Comportamento:
+ * - Sempre adiciona "Vary: Origin".
+ * - Se credenciais habilitadas, espelha a Origin permitida e define "Access-Control-Allow-Credentials: true".
+ * - Caso contrário, usa "*" se habilitado globalmente, ou espelha Origins específicas.
+ * - Responde 200 em OPTIONS com cabeçalhos CORS configurados.
+ */
 func Cors(next http.Handler) http.Handler {
 	allowedOrigins := splitCSV(getEnv("CORS_ALLOW_ORIGINS", "*"))
 	allowedMethods := getEnv("CORS_ALLOW_METHODS", "GET, POST, PUT, DELETE, OPTIONS")
